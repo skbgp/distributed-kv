@@ -1,0 +1,21 @@
+# Binaries
+bin/
+*.exe
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Test output and profiles
+*.test
+*.out
+*.prof
+
+# Data directories (for local testing)
+/tmp/dkv-*
+/data/
