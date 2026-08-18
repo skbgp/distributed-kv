@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -164,9 +165,24 @@ func (cm *CompactionManager) GetSSTables() []*SSTable {
 
 // LoadExistingSSTables scans the data directory for existing SSTable files
 // and loads them. Called on startup to recover state.
+//
+// Only fully renamed .sst files are picked up. Anything still carrying the
+// temp suffix is the remains of a write that a crash interrupted before the
+// rename, so it is incomplete by definition and gets deleted.
 func (cm *CompactionManager) LoadExistingSSTables() error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
+
+	partials, err := filepath.Glob(filepath.Join(cm.dataDir, "*.sst"+tmpSSTableSuffix))
+	if err != nil {
+		return fmt.Errorf("glob partial SSTables: %w", err)
+	}
+	for _, path := range partials {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove partial SSTable %s: %w", path, err)
+		}
+		log.Printf("[compaction] discarded incomplete SSTable %s\n", filepath.Base(path))
+	}
 
 	files, err := filepath.Glob(filepath.Join(cm.dataDir, "*.sst"))
 	if err != nil {
