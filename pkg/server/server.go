@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -63,7 +64,7 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		s.handlePut(w, r, key)
 	case http.MethodDelete:
-		s.handleDelete(w, key)
+		s.handleDelete(w, r, key)
 	default:
 		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
 	}
@@ -96,6 +97,10 @@ func (s *Server) handleGet(w http.ResponseWriter, key string) {
 	})
 }
 
+// commitTimeout bounds how long a client waits for its write to be committed
+// by a majority before we give up and report the cluster unavailable.
+const commitTimeout = 3 * time.Second
+
 // handlePut writes a key-value pair through Raft consensus.
 // The write only succeeds if this node is the leader and a majority
 // of nodes confirm the replication.
@@ -116,15 +121,9 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 		Value: []byte(body.Value),
 	}
 
-	if err := s.node.Propose(cmd); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
-			"error":     err.Error(),
-			"leader_id": s.node.LeaderID(),
-		})
+	if !s.commit(w, r, cmd) {
 		return
 	}
-
-	time.Sleep(200 * time.Millisecond)
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "ok",
@@ -133,26 +132,49 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 }
 
 // handleDelete removes a key through Raft consensus.
-func (s *Server) handleDelete(w http.ResponseWriter, key string) {
+func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, key string) {
 	cmd := raft.Command{
 		Type: raft.CmdDelete,
 		Key:  key,
 	}
 
-	if err := s.node.Propose(cmd); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
-			"error":     err.Error(),
-			"leader_id": s.node.LeaderID(),
-		})
+	if !s.commit(w, r, cmd) {
 		return
 	}
-
-	time.Sleep(200 * time.Millisecond)
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "deleted",
 		"key":    key,
 	})
+}
+
+// commit replicates a command and blocks until a majority has committed it.
+// It writes the error response itself and reports whether the caller should
+// continue with a success response.
+//
+// This replaced a fixed 200ms sleep followed by an unconditional 200 OK — the
+// old code returned success even when replication had failed outright.
+func (s *Server) commit(w http.ResponseWriter, r *http.Request, cmd raft.Command) bool {
+	if !s.node.IsLeader() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error":     fmt.Sprintf("not the leader (leader is node %d)", s.node.LeaderID()),
+			"leader_id": s.node.LeaderID(),
+		})
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), commitTimeout)
+	defer cancel()
+
+	if err := s.node.ProposeAndWait(ctx, cmd); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error":     err.Error(),
+			"leader_id": s.node.LeaderID(),
+		})
+		return false
+	}
+
+	return true
 }
 
 // handleStatus returns the current node's status — used by the dashboard.
