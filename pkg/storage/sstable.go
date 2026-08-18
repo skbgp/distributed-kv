@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 )
@@ -14,6 +15,11 @@ const (
 	indexInterval = 16
 
 	bitsPerKey = 10
+
+	// tmpSSTableSuffix marks a partially written SSTable. Files carrying it
+	// are never loaded on recovery — they are the debris of an interrupted
+	// write, and get cleaned up at startup.
+	tmpSSTableSuffix = ".tmp"
 )
 
 // SSTableEntry is a single key-value pair stored in the SSTable.
@@ -57,13 +63,27 @@ type SSTable struct {
 // The entries MUST be in sorted order by key — the caller (memtable flush or
 // compaction) is responsible for this.
 //
+// The file is written atomically: all bytes go to a temporary path, get
+// fsynced, and are then renamed into place. A rename within a directory is
+// atomic, so a crash mid-write can leave a stray .tmp file but never a
+// half-written .sst that recovery would try to read as valid.
+//
 // Returns the SSTable handle (with index and bloom loaded) or an error.
 func WriteSSTable(path string, entries []SSTableEntry, level int) (*SSTable, error) {
-	file, err := os.Create(path)
+	tmpPath := path + tmpSSTableSuffix
+
+	file, err := os.Create(tmpPath)
 	if err != nil {
-		return nil, fmt.Errorf("create SSTable %s: %w", path, err)
+		return nil, fmt.Errorf("create SSTable %s: %w", tmpPath, err)
 	}
-	defer file.Close()
+
+	// Any failure past this point leaves a temp file behind; clean it up so a
+	// retry isn't tripped by leftovers.
+	cleanup := func(cause error) (*SSTable, error) {
+		file.Close()
+		os.Remove(tmpPath)
+		return nil, cause
+	}
 
 	var sparseIndex []indexEntry
 	bloom := NewBloomFilter(len(entries), bitsPerKey)
@@ -81,20 +101,20 @@ func WriteSSTable(path string, entries []SSTableEntry, level int) (*SSTable, err
 		bloom.Add([]byte(entry.Key))
 
 		if err := writeEntry(file, entry); err != nil {
-			return nil, fmt.Errorf("write entry %q: %w", entry.Key, err)
+			return cleanup(fmt.Errorf("write entry %q: %w", entry.Key, err))
 		}
 	}
 
 	indexOffset, _ := file.Seek(0, io.SeekCurrent)
 	indexSize, err := writeIndex(file, sparseIndex)
 	if err != nil {
-		return nil, fmt.Errorf("write index: %w", err)
+		return cleanup(fmt.Errorf("write index: %w", err))
 	}
 
 	bloomOffset, _ := file.Seek(0, io.SeekCurrent)
 	bloomData := bloom.Bytes()
 	if _, err := file.Write(bloomData); err != nil {
-		return nil, fmt.Errorf("write bloom filter: %w", err)
+		return cleanup(fmt.Errorf("write bloom filter: %w", err))
 	}
 
 	ft := footer{
@@ -106,11 +126,27 @@ func WriteSSTable(path string, entries []SSTableEntry, level int) (*SSTable, err
 		NumEntries:   uint32(len(entries)),
 	}
 	if err := writeFooter(file, ft); err != nil {
-		return nil, fmt.Errorf("write footer: %w", err)
+		return cleanup(fmt.Errorf("write footer: %w", err))
 	}
 
+	// Flush the contents before the rename, so the file the new name points at
+	// is guaranteed to be complete.
 	if err := file.Sync(); err != nil {
-		return nil, fmt.Errorf("fsync SSTable: %w", err)
+		return cleanup(fmt.Errorf("fsync SSTable: %w", err))
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("close SSTable: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("rename SSTable into place: %w", err)
+	}
+
+	// The rename itself is only durable once the directory entry is flushed.
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("fsync SSTable dir: %w", err)
 	}
 
 	return &SSTable{

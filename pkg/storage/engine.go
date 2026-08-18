@@ -4,16 +4,22 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"sync"
 )
 
 // Engine ties together the memtable, WAL, SSTables, and compaction
 // into a single coherent storage system.
 type Engine struct {
-	dataDir    string
-	memtable   *MemTable
-	immutable  *MemTable
+	dataDir   string
+	memtable  *MemTable
+	immutable *MemTable
+
+	// immutableSegID is the WAL segment that became active when `immutable`
+	// was swapped out. Every record belonging to `immutable` therefore lives
+	// in a segment with a smaller ID, and those segments — and only those —
+	// can be retired once its SSTable is durable.
+	immutableSegID uint64
+
 	wal        *WAL
 	compaction *CompactionManager
 	flushCh    chan struct{}
@@ -31,8 +37,7 @@ func NewEngine(dataDir string) (*Engine, error) {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
-	walPath := filepath.Join(dataDir, "wal.log")
-	wal, err := OpenWAL(walPath)
+	wal, err := OpenWAL(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("open WAL: %w", err)
 	}
@@ -69,18 +74,59 @@ func (e *Engine) Put(key string, value []byte) error {
 	if len(key) == 0 {
 		return fmt.Errorf("key cannot be empty")
 	}
+	return e.write(WALRecord{Op: OpPut, Key: key, Value: value})
+}
 
-	record := WALRecord{Op: OpPut, Key: key, Value: value}
+// Delete marks a key as deleted by writing a tombstone.
+// The actual data removal happens during compaction.
+func (e *Engine) Delete(key string) error {
+	if len(key) == 0 {
+		return fmt.Errorf("key cannot be empty")
+	}
+	return e.write(WALRecord{Op: OpDelete, Key: key})
+}
+
+// write is the single durable write path for both puts and deletes.
+//
+// The engine lock is held across the WAL append AND the memtable insert.
+// That looks heavy-handed — it means a reader waits on the fsync — but it is
+// what makes the WAL segment boundary meaningful: if the lock were released
+// between the two steps, a rotation could slip in and the record would end up
+// in a segment that gets retired while its data sits in the *new* memtable.
+// That exact interleaving is what used to lose writes during a flush.
+//
+// The finer-grained fix is to have the WAL return the segment it wrote to and
+// reconcile afterwards; that is more machinery than this engine needs, since
+// the fsync dominates the critical section either way.
+func (e *Engine) write(record WALRecord) error {
+	e.mu.Lock()
+
 	if err := e.wal.Write(record); err != nil {
+		e.mu.Unlock()
 		return fmt.Errorf("WAL write: %w", err)
 	}
 
-	e.mu.Lock()
-	shouldFlush := e.memtable.Put(key, value)
+	var shouldFlush bool
+	switch record.Op {
+	case OpPut:
+		shouldFlush = e.memtable.Put(record.Key, record.Value)
+	case OpDelete:
+		shouldFlush = e.memtable.Delete(record.Key)
+	}
+
+	if shouldFlush {
+		if err := e.rotateAndSwapLocked(); err != nil {
+			e.mu.Unlock()
+			return fmt.Errorf("rotate WAL for flush: %w", err)
+		}
+	}
 	e.mu.Unlock()
 
 	if shouldFlush {
-		e.triggerFlush()
+		select {
+		case e.flushCh <- struct{}{}:
+		default:
+		}
 	}
 
 	return nil
@@ -122,66 +168,76 @@ func (e *Engine) Get(key string) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
-// Delete marks a key as deleted by writing a tombstone.
-// The actual data removal happens during compaction.
-func (e *Engine) Delete(key string) error {
-	if len(key) == 0 {
-		return fmt.Errorf("key cannot be empty")
-	}
-
-	record := WALRecord{Op: OpDelete, Key: key}
-	if err := e.wal.Write(record); err != nil {
-		return fmt.Errorf("WAL write: %w", err)
-	}
-
-	e.mu.Lock()
-	shouldFlush := e.memtable.Delete(key)
-	e.mu.Unlock()
-
-	if shouldFlush {
-		e.triggerFlush()
-	}
-
-	return nil
-}
-
-// Close shuts down the engine gracefully. Flushes the current memtable
-// to disk so no data is lost, then stops background goroutines.
+// Close shuts down the engine gracefully. Stops the background flusher,
+// writes whatever is still in memory to disk, and only then retires the
+// WAL segments covering it.
 func (e *Engine) Close() error {
 
 	close(e.closeCh)
+	e.wg.Wait()
 
 	e.mu.Lock()
-	if e.memtable.Size() > 0 {
-		e.flushMemTable(e.memtable)
-	}
-	e.mu.Unlock()
+	defer e.mu.Unlock()
 
-	e.wg.Wait()
+	// A flush may have been signalled but not picked up before shutdown.
+	if e.immutable != nil {
+		if err := e.flushMemTable(e.immutable); err != nil {
+			e.wal.Close()
+			return fmt.Errorf("flush pending memtable on close: %w", err)
+		}
+		e.immutable = nil
+	}
+
+	if e.memtable.Size() > 0 {
+		if err := e.flushMemTable(e.memtable); err != nil {
+			e.wal.Close()
+			return fmt.Errorf("flush memtable on close: %w", err)
+		}
+		e.memtable = NewMemTable(0)
+
+		// Everything in memory is now durable in SSTables, so the log can be
+		// rolled forward and the old segments dropped.
+		newID, err := e.wal.Rotate()
+		if err != nil {
+			e.wal.Close()
+			return fmt.Errorf("rotate WAL on close: %w", err)
+		}
+		if err := e.wal.RemoveSegmentsBefore(newID); err != nil {
+			log.Printf("[engine] could not retire WAL segments on close: %v\n", err)
+		}
+	}
 
 	return e.wal.Close()
 }
 
-// triggerFlush swaps the active memtable with a fresh one and signals
-// the background flusher to write the old one to disk.
-func (e *Engine) triggerFlush() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+// rotateAndSwapLocked starts a new WAL segment and makes the current memtable
+// immutable, so the background flusher can write it out. The caller must hold
+// e.mu — the rotation and the swap have to be a single atomic step.
+func (e *Engine) rotateAndSwapLocked() error {
 
+	// A previous flush hasn't been picked up yet. Write it out inline rather
+	// than dropping it on the floor, and retire its segments first.
 	if e.immutable != nil {
 		log.Println("[engine] flush already in progress, flushing synchronously")
-		e.flushMemTable(e.immutable)
+		if err := e.flushMemTable(e.immutable); err != nil {
+			return err
+		}
+		if err := e.wal.RemoveSegmentsBefore(e.immutableSegID); err != nil {
+			log.Printf("[engine] could not retire WAL segments: %v\n", err)
+		}
 		e.immutable = nil
 	}
 
+	newID, err := e.wal.Rotate()
+	if err != nil {
+		return err
+	}
+
 	e.immutable = e.memtable
+	e.immutableSegID = newID
 	e.memtable = NewMemTable(0)
 
-	select {
-	case e.flushCh <- struct{}{}:
-	default:
-
-	}
+	return nil
 }
 
 // backgroundFlusher runs in a goroutine, waiting for flush signals.
@@ -195,16 +251,23 @@ func (e *Engine) backgroundFlusher() {
 		case <-e.flushCh:
 			e.mu.RLock()
 			imm := e.immutable
+			segID := e.immutableSegID
 			e.mu.RUnlock()
 
 			if imm == nil {
 				continue
 			}
 
-			e.flushMemTable(imm)
+			// Order matters: the SSTable must be durable before the WAL
+			// segments backing it are removed. If the flush fails we keep
+			// the segments, so the data is still recoverable on restart.
+			if err := e.flushMemTable(imm); err != nil {
+				log.Printf("[engine] flush failed, keeping WAL segments: %v\n", err)
+				continue
+			}
 
-			if err := e.wal.Reset(); err != nil {
-				log.Printf("[engine] WAL reset failed: %v\n", err)
+			if err := e.wal.RemoveSegmentsBefore(segID); err != nil {
+				log.Printf("[engine] could not retire WAL segments: %v\n", err)
 			}
 
 			e.mu.Lock()
@@ -225,7 +288,11 @@ func (e *Engine) backgroundFlusher() {
 }
 
 // flushMemTable writes all entries from a memtable to a new SSTable.
-func (e *Engine) flushMemTable(mt *MemTable) {
+//
+// It returns an error rather than only logging one, because the caller uses
+// success as the signal that the WAL segments behind this data are safe to
+// delete. Swallowing the error here would drop the records from both places.
+func (e *Engine) flushMemTable(mt *MemTable) error {
 
 	var entries []SSTableEntry
 	iter := mt.Iterator()
@@ -237,18 +304,18 @@ func (e *Engine) flushMemTable(mt *MemTable) {
 	}
 
 	if len(entries) == 0 {
-		return
+		return nil
 	}
 
 	path := e.compaction.NewSSTablePath()
 	sst, err := WriteSSTable(path, entries, 0)
 	if err != nil {
-		log.Printf("[engine] flush failed: %v\n", err)
-		return
+		return fmt.Errorf("write SSTable %s: %w", path, err)
 	}
 
 	e.compaction.AddSSTable(sst)
 	log.Printf("[engine] flushed %d entries to %s\n", len(entries), path)
+	return nil
 }
 
 // recoverFromWAL replays the write-ahead log to reconstruct the memtable
@@ -279,6 +346,7 @@ type EngineStats struct {
 	ImmutableEntries    int
 	SSTableCount        int
 	TotalSSTableEntries int
+	WALSegments         int
 }
 
 func (e *Engine) Stats() EngineStats {
@@ -288,6 +356,7 @@ func (e *Engine) Stats() EngineStats {
 	stats := EngineStats{
 		MemTableEntries: e.memtable.Size(),
 		MemTableBytes:   e.memtable.ApproximateBytes(),
+		WALSegments:     e.wal.SegmentCount(),
 	}
 
 	if e.immutable != nil {
