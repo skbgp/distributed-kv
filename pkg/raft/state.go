@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math/rand"
@@ -66,9 +67,21 @@ type RaftNode struct {
 	electionTimer *time.Timer
 	applyCh       chan LogEntry
 	stopCh        chan struct{}
+	stopOnce      sync.Once
 	rpcServer     *rpc.Server
 	listener      net.Listener
 	address       string
+
+	// commitWaiters holds callers blocked inside ProposeAndWait until their
+	// entry is committed by a majority. Without this the HTTP layer had no
+	// way to know a write was durable and simply guessed with a sleep.
+	commitWaiters []commitWaiter
+}
+
+// commitWaiter is one caller waiting for a specific log index to commit.
+type commitWaiter struct {
+	index uint64
+	ch    chan struct{}
 }
 
 // NewRaftNode creates a new Raft node. It doesn't start the node — call
@@ -103,7 +116,9 @@ func (rn *RaftNode) Start() error {
 		return fmt.Errorf("start RPC server: %w", err)
 	}
 
+	rn.mu.Lock()
 	rn.resetElectionTimer()
+	rn.mu.Unlock()
 
 	go rn.applyLoop()
 
@@ -114,13 +129,25 @@ func (rn *RaftNode) Start() error {
 }
 
 // Stop gracefully shuts down the node.
+//
+// The timer and listener are read under the lock: the election timer is
+// rewritten by resetElectionTimer from timer goroutines, so reading it bare
+// here was a data race. Stop is also safe to call more than once.
 func (rn *RaftNode) Stop() {
-	close(rn.stopCh)
-	if rn.listener != nil {
-		rn.listener.Close()
+	rn.stopOnce.Do(func() {
+		close(rn.stopCh)
+	})
+
+	rn.mu.Lock()
+	listener := rn.listener
+	timer := rn.electionTimer
+	rn.mu.Unlock()
+
+	if listener != nil {
+		listener.Close()
 	}
-	if rn.electionTimer != nil {
-		rn.electionTimer.Stop()
+	if timer != nil {
+		timer.Stop()
 	}
 }
 
@@ -175,7 +202,11 @@ func (rn *RaftNode) startElection() {
 		}(peerAddr)
 	}
 
+	// resetElectionTimer writes rn.electionTimer, so it needs the lock —
+	// this ran unlocked and raced with Stop() and with other timer resets.
+	rn.mu.Lock()
 	rn.resetElectionTimer()
+	rn.mu.Unlock()
 }
 
 // becomeLeader transitions this node to the leader state.
@@ -311,6 +342,7 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 		}
 
 		rn.signalApply()
+		rn.releaseCommitWaitersLocked()
 	}
 
 	reply.Success = true
@@ -453,24 +485,64 @@ func (rn *RaftNode) advanceCommitIndex() {
 		if replicatedCount > (len(rn.peers)+1)/2 {
 			rn.commitIndex = idx
 			rn.signalApply()
+			rn.releaseCommitWaitersLocked()
 		}
 	}
 }
 
-// Propose submits a new command to the Raft cluster. Only the leader
-// can accept proposals. If this node isn't the leader, it returns an
-// error with the leader's address so the client can redirect.
+// releaseCommitWaitersLocked wakes every caller whose entry has now been
+// committed. Must be called with rn.mu held.
+func (rn *RaftNode) releaseCommitWaitersLocked() {
+	if len(rn.commitWaiters) == 0 {
+		return
+	}
+
+	remaining := rn.commitWaiters[:0]
+	for _, w := range rn.commitWaiters {
+		if w.index <= rn.commitIndex {
+			close(w.ch)
+		} else {
+			remaining = append(remaining, w)
+		}
+	}
+	rn.commitWaiters = remaining
+}
+
+// cancelCommitWaiter removes a waiter that gave up (timeout or shutdown), so
+// the slice doesn't grow with abandoned entries.
+func (rn *RaftNode) cancelCommitWaiter(ch chan struct{}) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	for i, w := range rn.commitWaiters {
+		if w.ch == ch {
+			rn.commitWaiters = append(rn.commitWaiters[:i], rn.commitWaiters[i+1:]...)
+			return
+		}
+	}
+}
+
+// Propose appends a command to the leader's log and returns immediately,
+// without waiting for replication. Callers that need to know the write is
+// durable should use ProposeAndWait instead.
 func (rn *RaftNode) Propose(cmd Command) error {
+	_, _, err := rn.propose(cmd)
+	return err
+}
+
+// propose appends the command to the local log, returning the index and term
+// it was written at.
+func (rn *RaftNode) propose(cmd Command) (uint64, uint64, error) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
 	if rn.state != Leader {
-		return fmt.Errorf("not the leader (leader is node %d)", rn.leaderID)
+		return 0, 0, fmt.Errorf("not the leader (leader is node %d)", rn.leaderID)
 	}
 
 	data, err := EncodeCommand(cmd)
 	if err != nil {
-		return fmt.Errorf("encode command: %w", err)
+		return 0, 0, fmt.Errorf("encode command: %w", err)
 	}
 
 	entry := LogEntry{
@@ -484,6 +556,61 @@ func (rn *RaftNode) Propose(cmd Command) error {
 	log.Printf("[node %d] proposed command at index %d (term %d)\n",
 		rn.id, entry.Index, entry.Term)
 
+	return entry.Index, entry.Term, nil
+}
+
+// ProposeAndWait appends a command and blocks until a majority of the cluster
+// has replicated it — that is, until it is genuinely committed.
+//
+// This is the call the HTTP layer must use. Returning success before the
+// entry commits would acknowledge a write that a leader change could still
+// erase, which is exactly what the old fixed sleep did.
+func (rn *RaftNode) ProposeAndWait(ctx context.Context, cmd Command) error {
+	index, term, err := rn.propose(cmd)
+	if err != nil {
+		return err
+	}
+
+	ch := make(chan struct{})
+
+	rn.mu.Lock()
+	// It may already be committed by the time we get the lock back.
+	if rn.commitIndex >= index {
+		rn.mu.Unlock()
+		return rn.verifyCommitted(index, term)
+	}
+	rn.commitWaiters = append(rn.commitWaiters, commitWaiter{index: index, ch: ch})
+	rn.mu.Unlock()
+
+	select {
+	case <-ch:
+		return rn.verifyCommitted(index, term)
+
+	case <-ctx.Done():
+		rn.cancelCommitWaiter(ch)
+		return fmt.Errorf("timed out waiting for entry %d to commit", index)
+
+	case <-rn.stopCh:
+		rn.cancelCommitWaiter(ch)
+		return fmt.Errorf("node shutting down before entry %d committed", index)
+	}
+}
+
+// verifyCommitted confirms that the entry sitting at index is still the one
+// we appended. If leadership changed, a new leader may have overwritten that
+// slot with a different entry from a later term — in which case our write did
+// not survive and the client must not be told it succeeded.
+func (rn *RaftNode) verifyCommitted(index uint64, term uint64) error {
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+
+	if index >= uint64(len(rn.log)) {
+		return fmt.Errorf("entry %d disappeared from the log after a leader change", index)
+	}
+	if rn.log[index].Term != term {
+		return fmt.Errorf("entry %d was overwritten by a new leader (term %d, expected %d)",
+			index, rn.log[index].Term, term)
+	}
 	return nil
 }
 
@@ -600,7 +727,10 @@ func (rn *RaftNode) startRPCServer() error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", rn.address, err)
 	}
+
+	rn.mu.Lock()
 	rn.listener = listener
+	rn.mu.Unlock()
 
 	go func() {
 		for {
