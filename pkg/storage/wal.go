@@ -286,30 +286,25 @@ func (w *WAL) Replay(handler func(WALRecord)) error {
 		return err
 	}
 
-	for _, id := range ids {
-		clean, err := w.replaySegment(id, handler)
-		if err != nil {
+	for i, id := range ids {
+		if err := w.replaySegment(id, i == len(ids)-1, handler); err != nil {
 			return err
-		}
-		if !clean {
-			break
 		}
 	}
 
 	return nil
 }
 
-// replaySegment replays one segment, reporting whether it was read all the
-// way to a clean EOF.
-func (w *WAL) replaySegment(id uint64, handler func(WALRecord)) (bool, error) {
+// replaySegment truncates a damaged tail only in the active segment.
+func (w *WAL) replaySegment(id uint64, active bool, handler func(WALRecord)) error {
 	path := filepath.Join(w.dir, segmentName(id))
 
 	file, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return true, nil
+			return nil
 		}
-		return false, fmt.Errorf("open WAL segment %s: %w", path, err)
+		return fmt.Errorf("open WAL segment %s: %w", path, err)
 	}
 	defer file.Close()
 
@@ -318,19 +313,17 @@ func (w *WAL) replaySegment(id uint64, handler func(WALRecord)) (bool, error) {
 	for {
 		record, err := decodeRecord(file)
 		if err == io.EOF {
-			return true, nil
+			return nil
 		}
 		if err != nil {
-			log.Printf("[wal] corrupt record in %s at offset %d, truncating tail: %v\n",
-				segmentName(id), validPos, err)
-
-			if truncErr := file.Truncate(validPos); truncErr != nil {
-				log.Printf("[wal] truncate failed: %v\n", truncErr)
+			if !active {
+				return fmt.Errorf("corrupt sealed WAL segment %d at %d: %w", id, validPos, err)
 			}
-			if syncErr := file.Sync(); syncErr != nil {
-				log.Printf("[wal] fsync after truncate failed: %v\n", syncErr)
+			log.Printf("[wal] truncating damaged tail in %s at %d: %v", segmentName(id), validPos, err)
+			if err := file.Truncate(validPos); err != nil {
+				return err
 			}
-			return false, nil
+			return file.Sync()
 		}
 
 		handler(record)
@@ -417,7 +410,7 @@ func decodeRecord(r io.Reader) (WALRecord, error) {
 	if totalLen > 64*1024*1024 {
 		return WALRecord{}, fmt.Errorf("record too large (%d bytes), likely corruption", totalLen)
 	}
-	if totalLen < 4 {
+	if totalLen < 5 {
 		return WALRecord{}, fmt.Errorf("record too small (%d bytes), likely corruption", totalLen)
 	}
 
@@ -458,7 +451,7 @@ func decodeRecord(r io.Reader) (WALRecord, error) {
 	}
 
 	var value []byte
-	if valLen > 0 {
+	if valLen > 0 || op == OpPut {
 		value = make([]byte, valLen)
 		copy(value, data[offset:offset+int(valLen)])
 	}

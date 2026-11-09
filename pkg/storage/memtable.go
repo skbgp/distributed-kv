@@ -63,6 +63,9 @@ func (m *MemTable) Delete(key string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if old, found := m.sl.Get(key); found {
+		m.currentSize -= len(key) + len(old)
+	}
 	m.sl.Insert(key, nil)
 	m.currentSize += len(key)
 

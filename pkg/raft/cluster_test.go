@@ -87,6 +87,9 @@ func (c *testCluster) stop(i int) {
 	}
 	c.stopped[i] = true
 	c.nodes[i].Stop()
+	if err := c.nodes[i].engine.Close(); err != nil {
+		c.t.Errorf("close node %d: %v", i, err)
+	}
 }
 
 func (c *testCluster) isStopped(i int) bool {
@@ -334,4 +337,77 @@ func allApplied(c *testCluster, numKeys int) bool {
 		}
 	}
 	return true
+}
+
+func TestCluster_FullRestartRecoversKeyOnFormerOfflineFollower(t *testing.T) {
+	c := newTestCluster(t, 3)
+	leader := c.waitForLeader(5 * time.Second)
+	offline := (leader + 1) % 3
+	c.stop(offline)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.nodes[leader].ProposeAndWait(ctx, Command{Type: CmdPut, Key: "empty", Value: []byte{}}); err != nil {
+		t.Fatal(err)
+	}
+	if value, found, err := c.nodes[leader].engine.Get("empty"); err != nil || !found || value == nil {
+		t.Fatalf("acknowledgement preceded local apply: %v %t %v", value, found, err)
+	}
+
+	c.stopAll()
+	for i, previous := range c.nodes {
+		engine, err := storage.NewEngine(previous.engine.DataDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		node := NewRaftNode(previous.id, previous.address, previous.peers, engine)
+		if err := node.Start(); err != nil {
+			engine.Close()
+			t.Fatal(err)
+		}
+		c.nodes[i], c.stopped[i] = node, false
+	}
+
+	c.waitForLeader(5 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		value, found, err := c.nodes[offline].engine.Get("empty")
+		if err == nil && found && value != nil && len(value) == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("offline replica did not catch up after the full restart")
+}
+
+func TestRequestVotePersistsVoteAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := storage.NewEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := NewRaftNode(1, "localhost:0", nil, engine)
+	defer node.Stop()
+	var vote RequestVoteReply
+	if err := node.RequestVote(&RequestVoteArgs{Term: 9, CandidateID: 2}, &vote); err != nil || !vote.VoteGranted {
+		t.Fatalf("initial vote: %+v %v", vote, err)
+	}
+	node.Stop()
+	if err := engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := storage.NewEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	restarted := NewRaftNode(1, "localhost:0", nil, reopened)
+	defer restarted.Stop()
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	vote = RequestVoteReply{}
+	if err := restarted.RequestVote(&RequestVoteArgs{Term: 9, CandidateID: 3}, &vote); err != nil || vote.VoteGranted || vote.Term != 9 {
+		t.Fatalf("second vote in same term: %+v %v", vote, err)
+	}
 }

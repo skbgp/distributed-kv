@@ -55,6 +55,7 @@ type SSTable struct {
 	index   []indexEntry
 	bloom   *BloomFilter
 	entries int
+	dataEnd int64
 	level   int
 	mu      sync.RWMutex
 }
@@ -154,6 +155,7 @@ func WriteSSTable(path string, entries []SSTableEntry, level int) (*SSTable, err
 		index:   sparseIndex,
 		bloom:   bloom,
 		entries: len(entries),
+		dataEnd: ft.IndexOffset,
 		level:   level,
 	}, nil
 }
@@ -183,12 +185,19 @@ func OpenSSTable(path string, level int) (*SSTable, error) {
 		return nil, fmt.Errorf("read bloom: %w", err)
 	}
 	bloom := LoadBloomFilter(bloomData, ft.BloomNumHash)
+	// The legacy footer stores padded byte length. Recover the original
+	// modulus from the entry count and this format's fixed bits-per-key.
+	bloom.numBits = max(64, ft.NumEntries*bitsPerKey)
+	if uint64(bloom.numBits) > uint64(len(bloomData))*8 {
+		return nil, fmt.Errorf("invalid SSTable Bloom size")
+	}
 
 	return &SSTable{
 		path:    path,
 		index:   sparseIndex,
 		bloom:   bloom,
 		entries: int(ft.NumEntries),
+		dataEnd: ft.IndexOffset,
 		level:   level,
 	}, nil
 }
@@ -205,7 +214,7 @@ func (sst *SSTable) Get(key string) ([]byte, bool, error) {
 	sst.mu.RLock()
 	defer sst.mu.RUnlock()
 
-	if !sst.bloom.MayContain([]byte(key)) {
+	if len(sst.index) == 0 || !sst.bloom.MayContain([]byte(key)) {
 		return nil, false, nil
 	}
 
@@ -224,26 +233,18 @@ func (sst *SSTable) Get(key string) ([]byte, bool, error) {
 	defer file.Close()
 
 	startOffset := sst.index[regionIdx].Offset
-	if _, err := file.Seek(startOffset, io.SeekStart); err != nil {
-		return nil, false, fmt.Errorf("seek to offset: %w", err)
-	}
-
-	var endOffset int64
+	endOffset := sst.dataEnd
 	if regionIdx+1 < len(sst.index) {
 		endOffset = sst.index[regionIdx+1].Offset
-	} else {
-
-		endOffset = sst.index[regionIdx].Offset + int64(sst.entries)*256
+	}
+	if startOffset < 0 || endOffset < startOffset || endOffset > sst.dataEnd {
+		return nil, false, fmt.Errorf("invalid SSTable index bounds")
 	}
 
+	region := io.NewSectionReader(file, startOffset, endOffset-startOffset)
 	for {
-		currentPos, _ := file.Seek(0, io.SeekCurrent)
-		if currentPos >= endOffset && regionIdx+1 < len(sst.index) {
-			break
-		}
-
-		entry, err := readEntry(file)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		entry, err := readEntry(region)
+		if err == io.EOF {
 			break
 		}
 		if err != nil {

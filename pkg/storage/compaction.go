@@ -1,241 +1,200 @@
 package storage
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/shubham/distributed-kv/pkg/persist"
 )
 
 const (
 	maxLevel0Tables = 4
-
-	level1MaxSize  = 10 * 1024 * 1024
-	sizeMultiplier = 10
+	manifestName    = "sstables.json"
 )
 
-// CompactionManager tracks SSTables across levels and runs compaction
-// when levels get too full.
+type tableRef struct {
+	Name  string
+	Level int
+}
+
+// CompactionManager publishes a durable table set and keeps its input files
+// available until any lookup using them has finished.
 type CompactionManager struct {
-	levels     map[int][]*SSTable
+	tables     []*SSTable // newest first, with level 0 ahead of level 1
 	dataDir    string
 	mu         sync.RWMutex
 	nextFileID atomic.Int64
-	running    atomic.Bool
+	publishErr error
 }
 
-// NewCompactionManager creates a manager for the given data directory.
 func NewCompactionManager(dataDir string) *CompactionManager {
-	cm := &CompactionManager{
-		levels:  make(map[int][]*SSTable),
-		dataDir: dataDir,
-	}
+	cm := &CompactionManager{dataDir: dataDir}
 	cm.nextFileID.Store(time.Now().UnixMicro())
 	return cm
 }
 
-// AddSSTable registers a new SSTable at the specified level.
-// Called after a memtable flush (level 0) or after compaction produces
-// new SSTables at a higher level.
-func (cm *CompactionManager) AddSSTable(sst *SSTable) {
+func (cm *CompactionManager) AddSSTable(sst *SSTable) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	cm.levels[sst.Level()] = append(cm.levels[sst.Level()], sst)
+
+	tables := append([]*SSTable{sst}, cm.tables...)
+	sort.SliceStable(tables, func(i, j int) bool {
+		return tables[i].Level() < tables[j].Level()
+	})
+	return cm.publish(tables)
 }
 
-// NeedsCompaction checks if any level has too many SSTables.
-// The engine calls this after every flush to decide whether to kick
-// off a background compaction.
+func (cm *CompactionManager) publish(tables []*SSTable) error {
+	if cm.publishErr != nil {
+		return cm.publishErr
+	}
+	refs := make([]tableRef, 0, len(tables))
+	for _, table := range tables {
+		refs = append(refs, tableRef{filepath.Base(table.Path()), table.Level()})
+	}
+	data, err := json.Marshal(refs)
+	if err == nil {
+		err = persist.Replace(filepath.Join(cm.dataDir, manifestName), data)
+	}
+	if err != nil {
+		// Rename may already have succeeded. Keep both sets of files and
+		// require reopening before trying to publish anything else.
+		cm.publishErr = fmt.Errorf("publish SSTable manifest: %w", err)
+		return cm.publishErr
+	}
+	cm.tables = tables
+	return nil
+}
+
 func (cm *CompactionManager) NeedsCompaction() bool {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	if len(cm.levels[0]) >= maxLevel0Tables {
-		return true
-	}
-
-	return false
+	return len(cm.tables) >= maxLevel0Tables && cm.tables[maxLevel0Tables-1].Level() == 0
 }
 
-// RunCompaction merges SSTables from level 0 into level 1.
-//
-// This is the simplified version — in production systems you'd also
-// compact level N into level N+1, handle concurrent reads during
-// compaction, etc. But L0→L1 is where the magic happens and covers
-// the most important interview talking points.
-//
-// The algorithm:
-//  1. Pick all L0 SSTables (they might overlap)
-//  2. Find all L1 SSTables that overlap with the L0 key range
-//  3. K-way merge all of them, keeping only the newest version of each key
-//  4. Write the merged result as new L1 SSTables
-//  5. Delete the old SSTables
+// RunCompaction merges every visible table, keeping the most recent value or
+// deletion. Publish the new table set before unlinking any inputs.
 func (cm *CompactionManager) RunCompaction() error {
-	if !cm.running.CompareAndSwap(false, true) {
-		return nil
-	}
-	defer cm.running.Store(false)
-
-	cm.mu.Lock()
-	l0Tables := cm.levels[0]
-	if len(l0Tables) == 0 {
-		cm.mu.Unlock()
-		return nil
-	}
-
-	l1Tables := cm.levels[1]
-	cm.mu.Unlock()
-
-	var allEntries []SSTableEntry
-
-	for _, sst := range l0Tables {
-		entries, err := sst.AllEntries()
-		if err != nil {
-			return fmt.Errorf("read L0 SSTable %s: %w", sst.Path(), err)
-		}
-		allEntries = append(allEntries, entries...)
-	}
-
-	for _, sst := range l1Tables {
-		entries, err := sst.AllEntries()
-		if err != nil {
-			return fmt.Errorf("read L1 SSTable %s: %w", sst.Path(), err)
-		}
-		allEntries = append(allEntries, entries...)
-	}
-
-	sort.SliceStable(allEntries, func(i, j int) bool {
-		return allEntries[i].Key < allEntries[j].Key
-	})
-
-	deduplicated := deduplicateEntries(allEntries)
-
-	newPath := cm.newSSTablePath()
-	newSST, err := WriteSSTable(newPath, deduplicated, 1)
-	if err != nil {
-		return fmt.Errorf("write compacted SSTable: %w", err)
-	}
-
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	for _, sst := range l0Tables {
-		os.Remove(sst.Path())
+	if len(cm.tables) == 0 || cm.tables[0].Level() != 0 {
+		return nil
 	}
-	cm.levels[0] = nil
-
-	for _, sst := range l1Tables {
-		os.Remove(sst.Path())
+	inputs := cm.tables
+	var entries []SSTableEntry
+	for _, table := range inputs {
+		run, err := table.AllEntries()
+		if err != nil {
+			return err
+		}
+		entries = append(entries, run...)
 	}
-	cm.levels[1] = []*SSTable{newSST}
-
-	return nil
-}
-
-// GetSSTables returns all SSTables in read order: Level 0 first (newest),
-// then Level 1, then Level 2, etc. Within each level, newer tables come
-// first. This ordering ensures that we always find the most recent version
-// of a key first.
-func (cm *CompactionManager) GetSSTables() []*SSTable {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-
-	var result []*SSTable
-
-	var levels []int
-	for lvl := range cm.levels {
-		levels = append(levels, lvl)
-	}
-	sort.Ints(levels)
-
-	for _, lvl := range levels {
-		tables := cm.levels[lvl]
-
-		for i := len(tables) - 1; i >= 0; i-- {
-			result = append(result, tables[i])
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	output := entries[:0]
+	for _, entry := range entries {
+		if len(output) == 0 || output[len(output)-1].Key != entry.Key {
+			output = append(output, entry)
 		}
 	}
 
-	return result
+	table, err := WriteSSTable(cm.NewSSTablePath(), output, 1)
+	if err != nil {
+		return err
+	}
+	if err := cm.publish([]*SSTable{table}); err != nil {
+		return err
+	}
+	for _, input := range inputs {
+		if err := os.Remove(input.Path()); err != nil {
+			log.Printf("[compaction] remove retired table: %v", err)
+		}
+	}
+	return nil
 }
 
-// LoadExistingSSTables scans the data directory for existing SSTable files
-// and loads them. Called on startup to recover state.
-//
-// Only fully renamed .sst files are picked up. Anything still carrying the
-// temp suffix is the remains of a write that a crash interrupted before the
-// rename, so it is incomplete by definition and gets deleted.
+func (cm *CompactionManager) get(key string) ([]byte, bool, error) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	for _, table := range cm.tables {
+		value, found, err := table.Get(key)
+		if err != nil || found {
+			return value, found, err
+		}
+	}
+	return nil, false, nil
+}
+
+// GetSSTables is a snapshot for statistics. Reads use get, which holds the
+// manager read lock until the disk lookup is finished.
+func (cm *CompactionManager) GetSSTables() []*SSTable {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return append([]*SSTable(nil), cm.tables...)
+}
+
 func (cm *CompactionManager) LoadExistingSSTables() error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	partials, err := filepath.Glob(filepath.Join(cm.dataDir, "*.sst"+tmpSSTableSuffix))
-	if err != nil {
-		return fmt.Errorf("glob partial SSTables: %w", err)
-	}
-	for _, path := range partials {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove partial SSTable %s: %w", path, err)
-		}
-		log.Printf("[compaction] discarded incomplete SSTable %s\n", filepath.Base(path))
-	}
-
 	files, err := filepath.Glob(filepath.Join(cm.dataDir, "*.sst"))
 	if err != nil {
-		return fmt.Errorf("glob SSTables: %w", err)
+		return err
 	}
-
 	for _, path := range files {
-
-		sst, err := OpenSSTable(path, 1)
-		if err != nil {
-			return fmt.Errorf("open SSTable %s: %w", path, err)
+		id, err := strconv.ParseInt(strings.TrimSuffix(filepath.Base(path), ".sst"), 10, 64)
+		if err == nil && id > cm.nextFileID.Load() {
+			cm.nextFileID.Store(id)
 		}
-		cm.levels[sst.Level()] = append(cm.levels[sst.Level()], sst)
 	}
 
+	var refs []tableRef
+	data, err := os.ReadFile(filepath.Join(cm.dataDir, manifestName))
+	legacy := errors.Is(err, os.ErrNotExist)
+	switch {
+	case legacy:
+		// Older versions recover all table files in filename order.
+		for i := len(files) - 1; i >= 0; i-- {
+			refs = append(refs, tableRef{filepath.Base(files[i]), 1})
+		}
+	case err != nil:
+		return err
+	default:
+		if err := json.Unmarshal(data, &refs); err != nil {
+			return fmt.Errorf("read SSTable manifest: %w", err)
+		}
+	}
+
+	var tables []*SSTable
+	for _, ref := range refs {
+		if filepath.Base(ref.Name) != ref.Name || !strings.HasSuffix(ref.Name, ".sst") {
+			return fmt.Errorf("invalid SSTable manifest entry %q", ref.Name)
+		}
+		table, err := OpenSSTable(filepath.Join(cm.dataDir, ref.Name), ref.Level)
+		if err != nil {
+			return err
+		}
+		tables = append(tables, table)
+	}
+	if legacy {
+		return cm.publish(tables)
+	}
+	cm.tables = tables
 	return nil
 }
 
-// newSSTablePath generates a unique filename for a new SSTable.
-func (cm *CompactionManager) newSSTablePath() string {
-	id := cm.nextFileID.Add(1)
-	return filepath.Join(cm.dataDir, fmt.Sprintf("%020d.sst", id))
-}
-
-// NewSSTablePath is the exported version — used by the engine when flushing.
 func (cm *CompactionManager) NewSSTablePath() string {
-	return cm.newSSTablePath()
-}
-
-// deduplicateEntries keeps only the first occurrence of each key.
-// The input must be sorted by key. Since we put newer entries first
-// during the merge phase, "first" means "newest."
-func deduplicateEntries(entries []SSTableEntry) []SSTableEntry {
-	if len(entries) == 0 {
-		return entries
-	}
-
-	result := make([]SSTableEntry, 0, len(entries))
-	result = append(result, entries[0])
-
-	for i := 1; i < len(entries); i++ {
-		if entries[i].Key != entries[i-1].Key {
-
-			result = append(result, entries[i])
-		}
-
-	}
-
-	final := make([]SSTableEntry, 0, len(result))
-	for _, e := range result {
-		if e.Value != nil {
-			final = append(final, e)
-		}
-	}
-	return final
+	return filepath.Join(cm.dataDir, fmt.Sprintf("%020d.sst", cm.nextFileID.Add(1)))
 }

@@ -74,6 +74,9 @@ func (e *Engine) Put(key string, value []byte) error {
 	if len(key) == 0 {
 		return fmt.Errorf("key cannot be empty")
 	}
+	if value == nil {
+		value = []byte{}
+	}
 	return e.write(WALRecord{Op: OpPut, Key: key, Value: value})
 }
 
@@ -141,31 +144,17 @@ func (e *Engine) write(record WALRecord) error {
 // Returns (nil, true) if the key exists but was deleted (tombstone).
 func (e *Engine) Get(key string) ([]byte, bool, error) {
 	e.mu.RLock()
+	defer e.mu.RUnlock()
 
 	if val, found := e.memtable.Get(key); found {
-		e.mu.RUnlock()
 		return val, true, nil
 	}
-
 	if e.immutable != nil {
 		if val, found := e.immutable.Get(key); found {
-			e.mu.RUnlock()
 			return val, true, nil
 		}
 	}
-	e.mu.RUnlock()
-
-	for _, sst := range e.compaction.GetSSTables() {
-		val, found, err := sst.Get(key)
-		if err != nil {
-			return nil, false, fmt.Errorf("SSTable read: %w", err)
-		}
-		if found {
-			return val, true, nil
-		}
-	}
-
-	return nil, false, nil
+	return e.compaction.get(key)
 }
 
 // Close shuts down the engine gracefully. Stops the background flusher,
@@ -249,28 +238,19 @@ func (e *Engine) backgroundFlusher() {
 	for {
 		select {
 		case <-e.flushCh:
-			e.mu.RLock()
-			imm := e.immutable
-			segID := e.immutableSegID
-			e.mu.RUnlock()
-
-			if imm == nil {
-				continue
-			}
-
-			// Order matters: the SSTable must be durable before the WAL
-			// segments backing it are removed. If the flush fails we keep
-			// the segments, so the data is still recoverable on restart.
-			if err := e.flushMemTable(imm); err != nil {
-				log.Printf("[engine] flush failed, keeping WAL segments: %v\n", err)
-				continue
-			}
-
-			if err := e.wal.RemoveSegmentsBefore(segID); err != nil {
-				log.Printf("[engine] could not retire WAL segments: %v\n", err)
-			}
-
 			e.mu.Lock()
+			if e.immutable == nil {
+				e.mu.Unlock()
+				continue
+			}
+			if err := e.flushMemTable(e.immutable); err != nil {
+				e.mu.Unlock()
+				log.Printf("[engine] flush failed, keeping WAL segments: %v", err)
+				continue
+			}
+			if err := e.wal.RemoveSegmentsBefore(e.immutableSegID); err != nil {
+				log.Printf("[engine] could not retire WAL segments: %v", err)
+			}
 			e.immutable = nil
 			e.mu.Unlock()
 
@@ -313,7 +293,9 @@ func (e *Engine) flushMemTable(mt *MemTable) error {
 		return fmt.Errorf("write SSTable %s: %w", path, err)
 	}
 
-	e.compaction.AddSSTable(sst)
+	if err := e.compaction.AddSSTable(sst); err != nil {
+		return err
+	}
 	log.Printf("[engine] flushed %d entries to %s\n", len(entries), path)
 	return nil
 }
@@ -371,3 +353,6 @@ func (e *Engine) Stats() EngineStats {
 
 	return stats
 }
+
+// DataDir is the storage directory owned by this node.
+func (e *Engine) DataDir() string { return e.dataDir }

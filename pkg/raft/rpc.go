@@ -52,7 +52,7 @@ const (
 type Command struct {
 	Type  CommandType `json:"type"`
 	Key   string      `json:"key"`
-	Value []byte      `json:"value,omitempty"`
+	Value []byte      `json:"value"`
 }
 
 // EncodeCommand serializes a command for storage in a log entry.

@@ -1,6 +1,6 @@
 # DistKV - Distributed Key-Value Store
 
-A distributed key-value store built from scratch in Go, featuring an LSM-tree storage engine and Raft consensus for fault-tolerant replication.
+A distributed key-value store built from scratch in Go, featuring an LSM-tree storage engine and an educational Raft implementation for replication.
 
 ## Architecture
 
@@ -17,7 +17,7 @@ Client (CLI / HTTP)
 └──────┬──────┘
        │
 ┌──────┴──────┐
-│   Storage   │ ← LSM Tree (MemTable → WAL → SSTable → Compaction)
+│   Storage   │ ← LSM Tree (WAL → MemTable → SSTable → Compaction)
 │   Engine    │
 └─────────────┘
 ```
@@ -34,8 +34,8 @@ Client (CLI / HTTP)
 ### Raft Consensus (Simplified)
 - **Leader Election**: Randomized timeouts to prevent split votes
 - **Log Replication**: AppendEntries RPC with consistency checks
-- **Commit Advancement**: Majority-based commit with safety guarantees
-- **Scope Limitations**: This is a simplified educational implementation. The Raft state (term, votedFor) and log are kept in-memory rather than being durably persisted, and snapshotting/log-compaction is omitted for brevity.
+- **Commit Advancement**: Persist entries before acknowledging replication. HTTP writes wait for a majority and successful local application
+- **Persistence and scope**: Term, vote, log and commit index are persisted atomically. Startup reapplies the committed PUT and DELETE prefix. Snapshots, dynamic membership and log compaction remain outside this implementation.
 
 ### HTTP Server
 - REST API: `PUT/GET/DELETE /api/kv/{key}`
@@ -60,7 +60,8 @@ make build
 ./bin/dkv-server --id 2 --port 9002 --peers "localhost:9001,localhost:9003" --data-dir /tmp/dkv-2
 ./bin/dkv-server --id 3 --port 9003 --peers "localhost:9001,localhost:9002" --data-dir /tmp/dkv-3
 
-# Use the CLI
+# Discover the leader with /api/status on ports 10001, 10002 and 10003.
+# Point the CLI at the leader for writes.
 ./bin/dkv-cli --server localhost:10001
 dkv> put name shubham
 OK
@@ -124,7 +125,7 @@ The WAL (Write-Ahead Log) is the backbone of durability. Every write is first ap
 Client → WAL (fsync) → MemTable (skip list) → [if full] → SSTable (disk)
 ```
 
-Writes are always sequential (WAL append) and in-memory (skip list insert), making them fast. The expensive part (flushing to SSTable) happens in the background and doesn't block the write path.
+The engine appends the WAL and updates a skip list. Background flushes serialize with writes when publishing an immutable memtable and retiring its WAL. Compaction also serializes table publication and disk reads to keep each lookup on a consistent table set.
 
 ### Read Path
 
@@ -132,28 +133,25 @@ Writes are always sequential (WAL append) and in-memory (skip list insert), maki
 Client → MemTable → Immutable MemTable → SSTables (newest first, bloom filter check)
 ```
 
-I check layers from newest to oldest, stopping at the first match. The Bloom filter on each SSTable skips ~99% of unnecessary disk reads (1% false positive rate with 10 bits per key).
+I check layers from newest to oldest, stopping at the first match. The Bloom filter can skip an SSTable without opening it on a negative result. With ten bits per key, its theoretical false-positive rate is around 1% under the usual hash assumptions.
 
-### Consistency Model
+### Consistency model
 
-- **Writes** go through Raft consensus. A write is only acknowledged after a majority of nodes have replicated it.
-- **Reads** go directly to the local storage engine without a Raft round. This is an "eventually consistent" read, so it might return slightly stale data if a write was just committed but not yet applied locally. A linearizable read would require a Raft round-trip, but for this project scope, the simpler approach is fine and easy to explain.
+- The leader acknowledges writes after a majority persists the Raft entry and the local engine applies it. Without quorum the HTTP write times out. A timed-out write can still commit later.
+- Reads use the local engine. A follower can lag, and the read API does not perform a Raft read-index round.
+- A replacement leader appends a current-term no-op so it can safely commit prior entries after an election. Existing data directories from pre-persistence versions retain their local values. Those releases kept Raft history in memory, so use a fresh cluster for replicated recovery testing.
 
 ### Compaction
 
-I implemented leveled compaction (L0 → L1). Level 0 tables can have overlapping key ranges (they come from separate memtable flushes). When L0 has ≥4 tables, a k-way merge runs against L1 to produce a single sorted, deduplicated SSTable. Tombstones are dropped at this stage since L1 is the bottom level.
+Four L0 tables trigger a merge of the visible tables into one L1 table. The merge sorts all entries and keeps the newest value or tombstone. The engine syncs the replacement file and atomically publishes its manifest before removing retired inputs. Lookups hold a read lock while accessing table files. The merge holds its inputs in memory, and the Raft log is unbounded without snapshots.
 
-## Benchmarks
+### Benchmarks
 
-The storage engine was benchmarked on an Apple M-series processor (SSD).
+```sh
+go test ./pkg/storage -run '^$' -bench . -benchmem
+```
 
-| Operation | Latency/Op | Bottleneck / Explanation |
-|-----------|------------|--------------------------|
-| **PUT** | `~3.7 ms` | Bound by `fsync()` on the WAL. Every write is guaranteed to be on disk before returning to ensure strict durability. |
-| **GET (MemTable)** | `~1.5 µs` | Immediate O(log n) lookup in the skip list. |
-| **GET (SSTable)** | `~15 µs` | Fast rejection via Bloom Filter (`O(1)`), followed by sparse index lookup and bounded disk read. |
-
-*(Note: Run `go test -bench .` in `pkg/storage` to run local benchmarks).*
+The benchmarks separate local engine PUT, an in-memory GET hit and an SSTable GET hit. They measure the storage engine. For cluster write latency, time HTTP requests against the elected leader and report the test setup.
 
 ## Tech Stack
 

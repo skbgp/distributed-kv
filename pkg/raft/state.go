@@ -63,14 +63,17 @@ type RaftNode struct {
 
 	engine *storage.Engine
 
-	mu            sync.RWMutex
-	electionTimer *time.Timer
-	applyCh       chan LogEntry
-	stopCh        chan struct{}
-	stopOnce      sync.Once
-	rpcServer     *rpc.Server
-	listener      net.Listener
-	address       string
+	mu                 sync.RWMutex
+	electionTimer      *time.Timer
+	electionGeneration uint64
+	applyCh            chan LogEntry
+	stopCh             chan struct{}
+	stopOnce           sync.Once
+	applyWG            sync.WaitGroup
+	diskErr            error
+	rpcServer          *rpc.Server
+	listener           net.Listener
+	address            string
 
 	// commitWaiters holds callers blocked inside ProposeAndWait until their
 	// entry is committed by a majority. Without this the HTTP layer had no
@@ -111,6 +114,14 @@ func NewRaftNode(id uint32, address string, peers []string, engine *storage.Engi
 // Start begins the Raft node: starts the RPC server, resets the election
 // timer, and begins the main event loop.
 func (rn *RaftNode) Start() error {
+	if err := rn.loadState(); err != nil {
+		return fmt.Errorf("recover Raft state: %w", err)
+	}
+	// PUT and DELETE replay safely in log order. Rebuild the applied
+	// prefix before accepting traffic, even after a crash during apply.
+	if err := rn.applyCommitted(); err != nil {
+		return fmt.Errorf("replay committed entries: %w", err)
+	}
 
 	if err := rn.startRPCServer(); err != nil {
 		return fmt.Errorf("start RPC server: %w", err)
@@ -120,10 +131,11 @@ func (rn *RaftNode) Start() error {
 	rn.resetElectionTimer()
 	rn.mu.Unlock()
 
+	rn.applyWG.Add(1)
 	go rn.applyLoop()
 
 	log.Printf("[node %d] started as %s at %s (peers: %v)\n",
-		rn.id, rn.state, rn.address, rn.peers)
+		rn.id, rn.State(), rn.address, rn.peers)
 
 	return nil
 }
@@ -149,13 +161,29 @@ func (rn *RaftNode) Stop() {
 	if timer != nil {
 		timer.Stop()
 	}
+	rn.applyWG.Wait()
 }
 
-func (rn *RaftNode) startElection() {
+func (rn *RaftNode) startElection(generation uint64) {
 	rn.mu.Lock()
+	if rn.electionGeneration != generation || rn.state == Leader || rn.stopped() || rn.diskErr != nil {
+		rn.mu.Unlock()
+		return
+	}
 	rn.state = Candidate
 	rn.currentTerm++
 	rn.votedFor = int32(rn.id)
+	rn.leaderID = 0
+	if rn.saveState() != nil {
+		rn.mu.Unlock()
+		return
+	}
+	rn.resetElectionTimer()
+	if len(rn.peers) == 0 {
+		rn.becomeLeader()
+		rn.mu.Unlock()
+		return
+	}
 	currentTerm := rn.currentTerm
 	lastLogIndex := rn.lastLogIndex()
 	lastLogTerm := rn.lastLogTerm()
@@ -183,6 +211,9 @@ func (rn *RaftNode) startElection() {
 			rn.mu.Lock()
 			defer rn.mu.Unlock()
 
+			if rn.stopped() || rn.diskErr != nil {
+				return
+			}
 			if reply.Term > rn.currentTerm {
 				rn.stepDown(reply.Term)
 				return
@@ -202,11 +233,6 @@ func (rn *RaftNode) startElection() {
 		}(peerAddr)
 	}
 
-	// resetElectionTimer writes rn.electionTimer, so it needs the lock —
-	// this ran unlocked and raced with Stop() and with other timer resets.
-	rn.mu.Lock()
-	rn.resetElectionTimer()
-	rn.mu.Unlock()
 }
 
 // becomeLeader transitions this node to the leader state.
@@ -221,11 +247,6 @@ func (rn *RaftNode) becomeLeader() {
 	log.Printf("[node %d] won election, now leader for term %d\n", rn.id, rn.currentTerm)
 
 	lastIdx := rn.lastLogIndex()
-	for _, addr := range rn.peers {
-
-		_ = addr
-	}
-
 	for id := uint32(1); id <= uint32(len(rn.peers)+1); id++ {
 		if id != rn.id {
 			rn.nextIndex[id] = lastIdx + 1
@@ -233,7 +254,14 @@ func (rn *RaftNode) becomeLeader() {
 		}
 	}
 
-	go rn.heartbeatLoop()
+	// A current-term no-op lets a replacement leader safely commit a
+	// previous term's replicated prefix even when no client is writing.
+	rn.log = append(rn.log, LogEntry{Term: rn.currentTerm, Index: lastIdx + 1})
+	if rn.saveState() != nil {
+		return
+	}
+	rn.advanceCommitIndex()
+	go rn.heartbeatLoop(rn.currentTerm)
 }
 
 // RequestVote is called by candidates asking for our vote.
@@ -242,15 +270,18 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
+	if rn.stopped() || rn.diskErr != nil {
+		return fmt.Errorf("node unavailable")
+	}
+	if args.Term > rn.currentTerm {
+		if err := rn.stepDown(args.Term); err != nil {
+			return err
+		}
+	}
 	reply.Term = rn.currentTerm
 	reply.VoteGranted = false
-
 	if args.Term < rn.currentTerm {
 		return nil
-	}
-
-	if args.Term > rn.currentTerm {
-		rn.stepDown(args.Term)
 	}
 
 	if rn.votedFor != -1 && rn.votedFor != int32(args.CandidateID) {
@@ -267,7 +298,12 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 		return nil
 	}
 
-	rn.votedFor = int32(args.CandidateID)
+	if rn.votedFor != int32(args.CandidateID) {
+		rn.votedFor = int32(args.CandidateID)
+		if err := rn.saveState(); err != nil {
+			return err
+		}
+	}
 	reply.VoteGranted = true
 	rn.resetElectionTimer()
 
@@ -283,70 +319,63 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
+	if rn.stopped() || rn.diskErr != nil {
+		return fmt.Errorf("node unavailable")
+	}
+	if args.Term > rn.currentTerm {
+		if err := rn.stepDown(args.Term); err != nil {
+			return err
+		}
+	}
 	reply.Term = rn.currentTerm
 	reply.Success = false
-
+	reply.MatchIndex = 0
 	if args.Term < rn.currentTerm {
 		return nil
 	}
-
-	if args.Term >= rn.currentTerm {
-		if args.Term > rn.currentTerm {
-			rn.stepDown(args.Term)
-		}
-		rn.state = Follower
-		rn.leaderID = args.LeaderID
-	}
-
+	rn.state = Follower
+	rn.leaderID = args.LeaderID
 	rn.resetElectionTimer()
 
-	if args.PrevLogIndex > 0 {
-		if args.PrevLogIndex >= uint64(len(rn.log)) {
-
-			reply.MatchIndex = uint64(len(rn.log)) - 1
-			return nil
+	if args.PrevLogIndex > rn.lastLogIndex() {
+		reply.MatchIndex = rn.lastLogIndex()
+		return nil
+	}
+	if rn.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		if args.PrevLogIndex > 0 {
+			reply.MatchIndex = args.PrevLogIndex - 1
 		}
-		if rn.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-
-			rn.log = rn.log[:args.PrevLogIndex]
-			reply.MatchIndex = uint64(len(rn.log)) - 1
-			return nil
-		}
+		return nil
 	}
 
+	changed := false
 	for i, entry := range args.Entries {
-		logIndex := args.PrevLogIndex + 1 + uint64(i)
-
-		if logIndex < uint64(len(rn.log)) {
-
-			if rn.log[logIndex].Term != entry.Term {
-
-				rn.log = rn.log[:logIndex]
-				rn.log = append(rn.log, args.Entries[i:]...)
-				break
-			}
-
-		} else {
-
-			rn.log = append(rn.log, args.Entries[i:]...)
-			break
+		index := args.PrevLogIndex + 1 + uint64(i)
+		if index <= rn.lastLogIndex() && rn.log[index].Term == entry.Term {
+			continue
 		}
+		if index <= rn.commitIndex {
+			return fmt.Errorf("refusing to overwrite committed entry %d", index)
+		}
+		rn.log = append(rn.log[:index], args.Entries[i:]...)
+		changed = true
+		break
 	}
-
-	if args.LeaderCommit > rn.commitIndex {
-		lastIdx := rn.lastLogIndex()
-		if args.LeaderCommit < lastIdx {
-			rn.commitIndex = args.LeaderCommit
-		} else {
-			rn.commitIndex = lastIdx
+	matched := args.PrevLogIndex + uint64(len(args.Entries))
+	commit := min(args.LeaderCommit, matched)
+	if commit > rn.commitIndex {
+		rn.commitIndex = commit
+		changed = true
+	}
+	if changed {
+		if err := rn.saveState(); err != nil {
+			return err
 		}
-
 		rn.signalApply()
-		rn.releaseCommitWaitersLocked()
 	}
 
 	reply.Success = true
-	reply.MatchIndex = rn.lastLogIndex()
+	reply.MatchIndex = matched
 	return nil
 }
 
@@ -354,7 +383,7 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 // AppendEntries RPCs to all followers. If there are new log entries,
 // they're included in the heartbeat. Otherwise, it's an empty heartbeat
 // just to prevent election timeouts.
-func (rn *RaftNode) heartbeatLoop() {
+func (rn *RaftNode) heartbeatLoop(term uint64) {
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
@@ -362,7 +391,7 @@ func (rn *RaftNode) heartbeatLoop() {
 		select {
 		case <-ticker.C:
 			rn.mu.RLock()
-			isLeader := rn.state == Leader
+			isLeader := rn.state == Leader && rn.currentTerm == term
 			rn.mu.RUnlock()
 
 			if !isLeader {
@@ -380,12 +409,11 @@ func (rn *RaftNode) heartbeatLoop() {
 // we send any log entries they're missing (based on nextIndex).
 func (rn *RaftNode) sendHeartbeats() {
 	rn.mu.RLock()
-	if rn.state != Leader {
+	if rn.state != Leader || rn.stopped() {
 		rn.mu.RUnlock()
 		return
 	}
 	currentTerm := rn.currentTerm
-	commitIndex := rn.commitIndex
 	rn.mu.RUnlock()
 
 	for peerID := uint32(1); peerID <= uint32(len(rn.peers)+1); peerID++ {
@@ -396,7 +424,7 @@ func (rn *RaftNode) sendHeartbeats() {
 		go func(pid uint32) {
 			rn.mu.RLock()
 			nextIdx, ok := rn.nextIndex[pid]
-			if !ok {
+			if !ok || rn.currentTerm != currentTerm || rn.state != Leader {
 				rn.mu.RUnlock()
 				return
 			}
@@ -412,6 +440,7 @@ func (rn *RaftNode) sendHeartbeats() {
 			if prevLogIndex > 0 && prevLogIndex < uint64(len(rn.log)) {
 				prevLogTerm = rn.log[prevLogIndex].Term
 			}
+			commitIndex := rn.commitIndex
 			rn.mu.RUnlock()
 
 			peerAddr := rn.peerAddress(pid)
@@ -436,6 +465,9 @@ func (rn *RaftNode) sendHeartbeats() {
 			rn.mu.Lock()
 			defer rn.mu.Unlock()
 
+			if rn.stopped() || rn.diskErr != nil {
+				return
+			}
 			if reply.Term > rn.currentTerm {
 				rn.stepDown(reply.Term)
 				return
@@ -446,19 +478,11 @@ func (rn *RaftNode) sendHeartbeats() {
 			}
 
 			if reply.Success {
-
-				if len(entries) > 0 {
-					rn.nextIndex[pid] = entries[len(entries)-1].Index + 1
-					rn.matchIndex[pid] = entries[len(entries)-1].Index
-				}
+				rn.matchIndex[pid] = max(rn.matchIndex[pid], reply.MatchIndex)
+				rn.nextIndex[pid] = rn.matchIndex[pid] + 1
 				rn.advanceCommitIndex()
-			} else {
-
-				if reply.MatchIndex+1 < rn.nextIndex[pid] {
-					rn.nextIndex[pid] = reply.MatchIndex + 1
-				} else if rn.nextIndex[pid] > 1 {
-					rn.nextIndex[pid]--
-				}
+			} else if rn.nextIndex[pid] == nextIdx && nextIdx > 1 {
+				rn.nextIndex[pid] = max(rn.matchIndex[pid]+1, min(nextIdx-1, reply.MatchIndex+1))
 			}
 		}(peerID)
 	}
@@ -469,29 +493,28 @@ func (rn *RaftNode) sendHeartbeats() {
 // Must be called with rn.mu held.
 func (rn *RaftNode) advanceCommitIndex() {
 
-	for idx := rn.commitIndex + 1; idx <= rn.lastLogIndex(); idx++ {
-
+	for idx := rn.lastLogIndex(); idx > rn.commitIndex; idx-- {
 		if rn.log[idx].Term != rn.currentTerm {
-			continue
+			break
 		}
-
-		replicatedCount := 1
-		for pid := uint32(1); pid <= uint32(len(rn.peers)+1); pid++ {
-			if pid != rn.id && rn.matchIndex[pid] >= idx {
-				replicatedCount++
+		count := 1
+		for _, matched := range rn.matchIndex {
+			if matched >= idx {
+				count++
 			}
 		}
-
-		if replicatedCount > (len(rn.peers)+1)/2 {
+		if count > (len(rn.peers)+1)/2 {
 			rn.commitIndex = idx
-			rn.signalApply()
-			rn.releaseCommitWaitersLocked()
+			if rn.saveState() == nil {
+				rn.signalApply()
+			}
+			return
 		}
 	}
 }
 
-// releaseCommitWaitersLocked wakes every caller whose entry has now been
-// committed. Must be called with rn.mu held.
+// releaseCommitWaitersLocked wakes callers whose committed entries have
+// been applied locally. Must be called with rn.mu held.
 func (rn *RaftNode) releaseCommitWaitersLocked() {
 	if len(rn.commitWaiters) == 0 {
 		return
@@ -499,7 +522,7 @@ func (rn *RaftNode) releaseCommitWaitersLocked() {
 
 	remaining := rn.commitWaiters[:0]
 	for _, w := range rn.commitWaiters {
-		if w.index <= rn.commitIndex {
+		if w.index <= rn.lastApplied {
 			close(w.ch)
 		} else {
 			remaining = append(remaining, w)
@@ -536,7 +559,7 @@ func (rn *RaftNode) propose(cmd Command) (uint64, uint64, error) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	if rn.state != Leader {
+	if rn.state != Leader || rn.stopped() || rn.diskErr != nil {
 		return 0, 0, fmt.Errorf("not the leader (leader is node %d)", rn.leaderID)
 	}
 
@@ -552,6 +575,10 @@ func (rn *RaftNode) propose(cmd Command) (uint64, uint64, error) {
 	}
 
 	rn.log = append(rn.log, entry)
+	if err := rn.saveState(); err != nil {
+		return 0, 0, err
+	}
+	rn.advanceCommitIndex()
 
 	log.Printf("[node %d] proposed command at index %d (term %d)\n",
 		rn.id, entry.Index, entry.Term)
@@ -559,12 +586,7 @@ func (rn *RaftNode) propose(cmd Command) (uint64, uint64, error) {
 	return entry.Index, entry.Term, nil
 }
 
-// ProposeAndWait appends a command and blocks until a majority of the cluster
-// has replicated it — that is, until it is genuinely committed.
-//
-// This is the call the HTTP layer must use. Returning success before the
-// entry commits would acknowledge a write that a leader change could still
-// erase, which is exactly what the old fixed sleep did.
+// ProposeAndWait waits for durable majority replication and local apply.
 func (rn *RaftNode) ProposeAndWait(ctx context.Context, cmd Command) error {
 	index, term, err := rn.propose(cmd)
 	if err != nil {
@@ -574,8 +596,8 @@ func (rn *RaftNode) ProposeAndWait(ctx context.Context, cmd Command) error {
 	ch := make(chan struct{})
 
 	rn.mu.Lock()
-	// It may already be committed by the time we get the lock back.
-	if rn.commitIndex >= index {
+	// The apply loop may have finished before we got the lock back.
+	if rn.lastApplied >= index {
 		rn.mu.Unlock()
 		return rn.verifyCommitted(index, term)
 	}
@@ -615,45 +637,49 @@ func (rn *RaftNode) verifyCommitted(index uint64, term uint64) error {
 }
 
 func (rn *RaftNode) applyLoop() {
+	defer rn.applyWG.Done()
 	for {
 		select {
 		case <-rn.applyCh:
-			rn.applyCommitted()
+			if err := rn.applyCommitted(); err != nil {
+				log.Printf("[node %d] apply: %v", rn.id, err)
+			}
 		case <-rn.stopCh:
 			return
 		}
 	}
 }
 
-func (rn *RaftNode) applyCommitted() {
+func (rn *RaftNode) applyCommitted() error {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	for rn.lastApplied < rn.commitIndex {
+	for rn.diskErr == nil && rn.lastApplied < rn.commitIndex {
+		entry := rn.log[rn.lastApplied+1]
+		if len(entry.Command) != 0 {
+			cmd, err := DecodeCommand(entry.Command)
+			if err != nil {
+				return err
+			}
+			switch cmd.Type {
+			case CmdPut:
+				err = rn.engine.Put(cmd.Key, cmd.Value)
+			case CmdDelete:
+				err = rn.engine.Delete(cmd.Key)
+			default:
+				err = fmt.Errorf("unknown command type %d", cmd.Type)
+			}
+			if err != nil {
+				rn.diskErr = fmt.Errorf("apply entry %d: %w", entry.Index, err)
+				rn.state = Follower
+				rn.leaderID = 0
+				return rn.diskErr
+			}
+		}
 		rn.lastApplied++
-		entry := rn.log[rn.lastApplied]
-
-		cmd, err := DecodeCommand(entry.Command)
-		if err != nil {
-			log.Printf("[node %d] failed to decode command at index %d: %v\n",
-				rn.id, entry.Index, err)
-			continue
-		}
-
-		switch cmd.Type {
-		case CmdPut:
-			if err := rn.engine.Put(cmd.Key, cmd.Value); err != nil {
-				log.Printf("[node %d] failed to apply PUT %q: %v\n", rn.id, cmd.Key, err)
-			}
-		case CmdDelete:
-			if err := rn.engine.Delete(cmd.Key); err != nil {
-				log.Printf("[node %d] failed to apply DELETE %q: %v\n", rn.id, cmd.Key, err)
-			}
-		}
-
-		log.Printf("[node %d] applied command at index %d: %s %q\n",
-			rn.id, entry.Index, cmdTypeName(cmd.Type), cmd.Key)
+		rn.releaseCommitWaitersLocked()
 	}
+	return rn.diskErr
 }
 
 func (rn *RaftNode) signalApply() {
@@ -664,11 +690,16 @@ func (rn *RaftNode) signalApply() {
 	}
 }
 
-func (rn *RaftNode) stepDown(newTerm uint64) {
+func (rn *RaftNode) stepDown(newTerm uint64) error {
 	rn.currentTerm = newTerm
 	rn.state = Follower
+	rn.leaderID = 0
 	rn.votedFor = -1
+	if err := rn.saveState(); err != nil {
+		return err
+	}
 	rn.resetElectionTimer()
+	return nil
 }
 
 func (rn *RaftNode) lastLogIndex() uint64 {
@@ -687,15 +718,9 @@ func (rn *RaftNode) resetElectionTimer() {
 		rn.electionTimer.Stop()
 	}
 
-	rn.electionTimer = time.AfterFunc(timeout, func() {
-		rn.mu.RLock()
-		state := rn.state
-		rn.mu.RUnlock()
-
-		if state != Leader {
-			rn.startElection()
-		}
-	})
+	rn.electionGeneration++
+	generation := rn.electionGeneration
+	rn.electionTimer = time.AfterFunc(timeout, func() { rn.startElection(generation) })
 }
 
 // peerAddress maps a peer ID to its network address.
@@ -721,7 +746,9 @@ func (rn *RaftNode) peerAddress(peerID uint32) string {
 
 func (rn *RaftNode) startRPCServer() error {
 	rn.rpcServer = rpc.NewServer()
-	rn.rpcServer.Register(rn)
+	if err := rn.rpcServer.Register(rn); err != nil {
+		return err
+	}
 
 	listener, err := net.Listen("tcp", rn.address)
 	if err != nil {
@@ -751,11 +778,15 @@ func (rn *RaftNode) startRPCServer() error {
 }
 
 func (rn *RaftNode) callRPC(addr string, method string, args interface{}, reply interface{}) error {
-	client, err := rpc.Dial("tcp", addr)
+	conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
 	if err != nil {
 		return err
 	}
+	client := rpc.NewClient(conn)
 	defer client.Close()
+	if err := conn.SetDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		return err
+	}
 	return client.Call(method, args, reply)
 }
 
